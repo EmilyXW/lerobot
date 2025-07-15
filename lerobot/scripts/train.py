@@ -16,96 +16,63 @@
 import logging
 import time
 from contextlib import nullcontext
-from copy import deepcopy
-from pathlib import Path
+from pprint import pformat
+from typing import Any
 
-import hydra
 import torch
-from omegaconf import DictConfig
-from torch.cuda.amp import GradScaler
+from termcolor import colored
+from torch.amp import GradScaler
+from torch.optim import Optimizer
 
 from lerobot.common.datasets.factory import make_dataset
+from lerobot.common.datasets.sampler import EpisodeAwareSampler
 from lerobot.common.datasets.utils import cycle
 from lerobot.common.envs.factory import make_env
-from lerobot.common.logger import Logger, log_output_dir
+from lerobot.common.optim.factory import make_optimizer_and_scheduler
 from lerobot.common.policies.factory import make_policy
-from lerobot.common.policies.policy_protocol import PolicyWithUpdate
+from lerobot.common.policies.pretrained import PreTrainedPolicy
 from lerobot.common.policies.utils import get_device_from_parameters
+from lerobot.common.utils.logging_utils import AverageMeter, MetricsTracker
+from lerobot.common.utils.random_utils import set_seed
+from lerobot.common.utils.train_utils import (
+    get_step_checkpoint_dir,
+    get_step_identifier,
+    load_training_state,
+    save_checkpoint,
+    update_last_checkpoint,
+)
 from lerobot.common.utils.utils import (
     format_big_number,
     get_safe_torch_device,
+    has_method,
     init_logging,
-    set_global_seed,
 )
+from lerobot.common.utils.wandb_utils import WandBLogger
+from lerobot.configs import parser
+from lerobot.configs.train import TrainPipelineConfig
 from lerobot.scripts.eval import eval_policy
 
 
-def make_optimizer_and_scheduler(cfg, policy):
-    if cfg.policy.name == "act":
-        optimizer_params_dicts = [
-            {
-                "params": [
-                    p
-                    for n, p in policy.named_parameters()
-                    if not n.startswith("backbone") and p.requires_grad
-                ]
-            },
-            {
-                "params": [
-                    p for n, p in policy.named_parameters() if n.startswith("backbone") and p.requires_grad
-                ],
-                "lr": cfg.training.lr_backbone,
-            },
-        ]
-        optimizer = torch.optim.AdamW(
-            optimizer_params_dicts, lr=cfg.training.lr, weight_decay=cfg.training.weight_decay
-        )
-        lr_scheduler = None
-    elif cfg.policy.name == "diffusion":
-        optimizer = torch.optim.Adam(
-            policy.diffusion.parameters(),
-            cfg.training.lr,
-            cfg.training.adam_betas,
-            cfg.training.adam_eps,
-            cfg.training.adam_weight_decay,
-        )
-        from diffusers.optimization import get_scheduler
-
-        lr_scheduler = get_scheduler(
-            cfg.training.lr_scheduler,
-            optimizer=optimizer,
-            num_warmup_steps=cfg.training.lr_warmup_steps,
-            num_training_steps=cfg.training.offline_steps,
-        )
-    elif policy.name == "tdmpc":
-        optimizer = torch.optim.Adam(policy.parameters(), cfg.training.lr)
-        lr_scheduler = None
-    else:
-        raise NotImplementedError()
-
-    return optimizer, lr_scheduler
-
-
 def update_policy(
-    policy,
-    batch,
-    optimizer,
-    grad_clip_norm,
+    train_metrics: MetricsTracker,
+    policy: PreTrainedPolicy,
+    batch: Any,
+    optimizer: Optimizer,
+    grad_clip_norm: float,
     grad_scaler: GradScaler,
     lr_scheduler=None,
     use_amp: bool = False,
-):
-    """Returns a dictionary of items for logging."""
+    lock=None,
+) -> tuple[MetricsTracker, dict]:
     start_time = time.perf_counter()
     device = get_device_from_parameters(policy)
     policy.train()
     with torch.autocast(device_type=device.type) if use_amp else nullcontext():
-        output_dict = policy.forward(batch)
+        loss, output_dict = policy.forward(batch)
         # TODO(rcadene): policy.unnormalize_outputs(out_dict)
-        loss = output_dict["loss"]
     grad_scaler.scale(loss).backward()
 
-    # Unscale the graident of the optimzer's assigned params in-place **prior to gradient clipping**.
+    # Unscale the gradient of the optimizer's assigned params in-place **prior to gradient clipping**.
     grad_scaler.unscale_(optimizer)
 
     grad_norm = torch.nn.utils.clip_grad_norm_(
@@ -116,258 +83,206 @@ def update_policy(
 
     # Optimizer's gradients are already unscaled, so scaler.step does not unscale them,
     # although it still skips optimizer.step() if the gradients contain infs or NaNs.
-    grad_scaler.step(optimizer)
+    with lock if lock is not None else nullcontext():
+        grad_scaler.step(optimizer)
     # Updates the scale for next iteration.
     grad_scaler.update()
 
     optimizer.zero_grad()
 
+    # Step through pytorch scheduler at every batch instead of epoch
     if lr_scheduler is not None:
         lr_scheduler.step()
 
-    if isinstance(policy, PolicyWithUpdate):
+    if has_method(policy, "update"):
         # To possibly update an internal buffer (for instance an Exponential Moving Average like in TDMPC).
         policy.update()
 
-    info = {
-        "loss": loss.item(),
-        "grad_norm": float(grad_norm),
-        "lr": optimizer.param_groups[0]["lr"],
-        "update_s": time.perf_counter() - start_time,
-        **{k: v for k, v in output_dict.items() if k != "loss"},
-    }
-
-    return info
+    train_metrics.loss = loss.item()
+    train_metrics.grad_norm = grad_norm.item()
+    train_metrics.lr = optimizer.param_groups[0]["lr"]
+    train_metrics.update_s = time.perf_counter() - start_time
+    return train_metrics, output_dict
 
 
-@hydra.main(version_base="1.2", config_name="default", config_path="../configs")
-def train_cli(cfg: dict):
-    train(
-        cfg,
-        out_dir=hydra.core.hydra_config.HydraConfig.get().run.dir,
-        job_name=hydra.core.hydra_config.HydraConfig.get().job.name,
-    )
+@parser.wrap()
+def train(cfg: TrainPipelineConfig):
+    cfg.validate()
+    logging.info(pformat(cfg.to_dict()))
 
+    if cfg.wandb.enable and cfg.wandb.project:
+        wandb_logger = WandBLogger(cfg)
+    else:
+        wandb_logger = None
+        logging.info(colored("Logs will be saved locally.", "yellow", attrs=["bold"]))
 
-def train_notebook(out_dir=None, job_name=None, config_name="default", config_path="../configs"):
-    from hydra import compose, initialize
-
-    hydra.core.global_hydra.GlobalHydra.instance().clear()
-    initialize(config_path=config_path)
-    cfg = compose(config_name=config_name)
-    train(cfg, out_dir=out_dir, job_name=job_name)
-
-
-def log_train_info(logger: Logger, info, step, cfg, dataset, is_offline):
-    loss = info["loss"]
-    grad_norm = info["grad_norm"]
-    lr = info["lr"]
-    update_s = info["update_s"]
-
-    # A sample is an (observation,action) pair, where observation and action
-    # can be on multiple timestamps. In a batch, we have `batch_size`` number of samples.
-    num_samples = (step + 1) * cfg.training.batch_size
-    avg_samples_per_ep = dataset.num_samples / dataset.num_episodes
-    num_episodes = num_samples / avg_samples_per_ep
-    num_epochs = num_samples / dataset.num_samples
-    log_items = [
-        f"step:{format_big_number(step)}",
-        # number of samples seen during training
-        f"smpl:{format_big_number(num_samples)}",
-        # number of episodes seen during training
-        f"ep:{format_big_number(num_episodes)}",
-        # number of time all unique samples are seen
-        f"epch:{num_epochs:.2f}",
-        f"loss:{loss:.3f}",
-        f"grdn:{grad_norm:.3f}",
-        f"lr:{lr:0.1e}",
-        # in seconds
-        f"updt_s:{update_s:.3f}",
-    ]
-    logging.info(" ".join(log_items))
-
-    info["step"] = step
-    info["num_samples"] = num_samples
-    info["num_episodes"] = num_episodes
-    info["num_epochs"] = num_epochs
-    info["is_offline"] = is_offline
-
-    logger.log_dict(info, step, mode="train")
-
-
-def log_eval_info(logger, info, step, cfg, dataset, is_offline):
-    eval_s = info["eval_s"]
-    avg_sum_reward = info["avg_sum_reward"]
-    pc_success = info["pc_success"]
-
-    # A sample is an (observation,action) pair, where observation and action
-    # can be on multiple timestamps. In a batch, we have `batch_size`` number of samples.
-    num_samples = (step + 1) * cfg.training.batch_size
-    avg_samples_per_ep = dataset.num_samples / dataset.num_episodes
-    num_episodes = num_samples / avg_samples_per_ep
-    num_epochs = num_samples / dataset.num_samples
-    log_items = [
-        f"step:{format_big_number(step)}",
-        # number of samples seen during training
-        f"smpl:{format_big_number(num_samples)}",
-        # number of episodes seen during training
-        f"ep:{format_big_number(num_episodes)}",
-        # number of time all unique samples are seen
-        f"epch:{num_epochs:.2f}",
-        f"∑rwrd:{avg_sum_reward:.3f}",
-        f"success:{pc_success:.1f}%",
-        f"eval_s:{eval_s:.3f}",
-    ]
-    logging.info(" ".join(log_items))
-
-    info["step"] = step
-    info["num_samples"] = num_samples
-    info["num_episodes"] = num_episodes
-    info["num_epochs"] = num_epochs
-    info["is_offline"] = is_offline
-
-    logger.log_dict(info, step, mode="eval")
-
-
-def train(cfg: DictConfig, out_dir: str | None = None, job_name: str | None = None):
-    if out_dir is None:
-        raise NotImplementedError()
-    if job_name is None:
-        raise NotImplementedError()
-
-    init_logging()
-
-    if cfg.training.online_steps > 0:
-        raise NotImplementedError("Online training is not implemented yet.")
+    if cfg.seed is not None:
+        set_seed(cfg.seed)
 
     # Check device is available
-    device = get_safe_torch_device(cfg.device, log=True)
-
+    device = get_safe_torch_device(cfg.policy.device, log=True)
     torch.backends.cudnn.benchmark = True
     torch.backends.cuda.matmul.allow_tf32 = True
-    set_global_seed(cfg.seed)
 
-    logging.info("make_dataset")
-    offline_dataset = make_dataset(cfg)
+    logging.info("Creating dataset")
+    dataset = make_dataset(cfg)
 
-    logging.info("make_env")
-    eval_env = make_env(cfg)
+    # Create environment used for evaluating checkpoints during training on simulation data.
+    # On real-world data, no need to create an environment as evaluations are done outside train.py,
+    # using the eval.py instead, with gym_dora environment and dora-rs.
+    eval_env = None
+    if cfg.eval_freq > 0 and cfg.env is not None:
+        logging.info("Creating env")
+        eval_env = make_env(cfg.env, n_envs=cfg.eval.batch_size, use_async_envs=cfg.eval.use_async_envs)
 
-    logging.info("make_policy")
-    policy = make_policy(hydra_cfg=cfg, dataset_stats=offline_dataset.stats)
+    logging.info("Creating policy")
+    policy = make_policy(
+        cfg=cfg.policy,
+        ds_meta=dataset.meta,
+    )
 
-    # Create optimizer and scheduler
-    # Temporary hack to move optimizer out of policy
+    logging.info("Creating optimizer and scheduler")
     optimizer, lr_scheduler = make_optimizer_and_scheduler(cfg, policy)
-    grad_scaler = GradScaler(enabled=cfg.use_amp)
+    grad_scaler = GradScaler(device.type, enabled=cfg.policy.use_amp)
+
+    step = 0  # number of policy updates (forward + backward + optim)
+
+    if cfg.resume:
+        step, optimizer, lr_scheduler = load_training_state(cfg.checkpoint_path, optimizer, lr_scheduler)
 
     num_learnable_params = sum(p.numel() for p in policy.parameters() if p.requires_grad)
     num_total_params = sum(p.numel() for p in policy.parameters())
 
-    # log metrics to terminal and wandb
-    logger = Logger(out_dir, job_name, cfg)
-
-    log_output_dir(out_dir)
-    logging.info(f"{cfg.env.task=}")
-    logging.info(f"{cfg.training.offline_steps=} ({format_big_number(cfg.training.offline_steps)})")
-    logging.info(f"{cfg.training.online_steps=}")
-    logging.info(f"{offline_dataset.num_samples=} ({format_big_number(offline_dataset.num_samples)})")
-    logging.info(f"{offline_dataset.num_episodes=}")
+    logging.info(colored("Output dir:", "yellow", attrs=["bold"]) + f" {cfg.output_dir}")
+    if cfg.env is not None:
+        logging.info(f"{cfg.env.task=}")
+    logging.info(f"{cfg.steps=} ({format_big_number(cfg.steps)})")
+    logging.info(f"{dataset.num_frames=} ({format_big_number(dataset.num_frames)})")
+    logging.info(f"{dataset.num_episodes=}")
     logging.info(f"{num_learnable_params=} ({format_big_number(num_learnable_params)})")
     logging.info(f"{num_total_params=} ({format_big_number(num_total_params)})")
 
-    # Note: this helper will be used in offline and online training loops.
-    def evaluate_and_checkpoint_if_needed(step):
-        if step % cfg.training.eval_freq == 0:
-            logging.info(f"Eval policy at step {step}")
-            with torch.no_grad(), torch.autocast(device_type=device.type) if cfg.use_amp else nullcontext():
-                eval_info = eval_policy(
-                    eval_env,
-                    policy,
-                    cfg.eval.n_episodes,
-                    video_dir=Path(out_dir) / "eval",
-                    max_episodes_rendered=4,
-                    start_seed=cfg.seed,
-                )
-            log_eval_info(logger, eval_info["aggregated"], step, cfg, offline_dataset, is_offline)
-            if cfg.wandb.enable:
-                logger.log_video(eval_info["video_paths"][0], step, mode="eval")
-            logging.info("Resume training")
-
-        if cfg.training.save_model and step % cfg.training.save_freq == 0:
-            logging.info(f"Checkpoint policy after step {step}")
-            # Note: Save with step as the identifier, and format it to have at least 6 digits but more if
-            # needed (choose 6 as a minimum for consistency without being overkill).
-            logger.save_model(
-                policy,
-                identifier=str(step).zfill(
-                    max(6, len(str(cfg.training.offline_steps + cfg.training.online_steps)))
-                ),
-            )
-            logging.info("Resume training")
-
     # create dataloader for offline training
+    if hasattr(cfg.policy, "drop_n_last_frames"):
+        shuffle = False
+        sampler = EpisodeAwareSampler(
+            dataset.episode_data_index,
+            drop_n_last_frames=cfg.policy.drop_n_last_frames,
+            shuffle=True,
+        )
+    else:
+        shuffle = True
+        sampler = None
+
     dataloader = torch.utils.data.DataLoader(
-        offline_dataset,
-        num_workers=4,
-        batch_size=cfg.training.batch_size,
-        shuffle=True,
+        dataset,
+        num_workers=cfg.num_workers,
+        batch_size=cfg.batch_size,
+        shuffle=shuffle,
+        sampler=sampler,
         pin_memory=device.type != "cpu",
         drop_last=False,
     )
     dl_iter = cycle(dataloader)
 
     policy.train()
-    is_offline = True
-    for step in range(cfg.training.offline_steps):
-        if step == 0:
-            logging.info("Start offline training on a fixed dataset")
+
+    train_metrics = {
+        "loss": AverageMeter("loss", ":.3f"),
+        "grad_norm": AverageMeter("grdn", ":.3f"),
+        "lr": AverageMeter("lr", ":0.1e"),
+        "update_s": AverageMeter("updt_s", ":.3f"),
+        "dataloading_s": AverageMeter("data_s", ":.3f"),
+    }
+
+    train_tracker = MetricsTracker(
+        cfg.batch_size, dataset.num_frames, dataset.num_episodes, train_metrics, initial_step=step
+    )
+
+    logging.info("Start offline training on a fixed dataset")
+    for _ in range(step, cfg.steps):
+        start_time = time.perf_counter()
         batch = next(dl_iter)
+        train_tracker.dataloading_s = time.perf_counter() - start_time
 
         for key in batch:
-            batch[key] = batch[key].to(device, non_blocking=True)
+            if isinstance(batch[key], torch.Tensor):
+                batch[key] = batch[key].to(device, non_blocking=True)
 
-        train_info = update_policy(
+        train_tracker, output_dict = update_policy(
+            train_tracker,
             policy,
             batch,
             optimizer,
-            cfg.training.grad_clip_norm,
+            cfg.optimizer.grad_clip_norm,
             grad_scaler=grad_scaler,
             lr_scheduler=lr_scheduler,
-            use_amp=cfg.use_amp,
+            use_amp=cfg.policy.use_amp,
         )
 
-        # TODO(rcadene): is it ok if step_t=0 = 0 and not 1 as previously done?
-        if step % cfg.training.log_freq == 0:
-            log_train_info(logger, train_info, step, cfg, offline_dataset, is_offline)
+        # Note: eval and checkpoint happens *after* the `step`th training update has completed, so we
+        # increment `step` here.
+        step += 1
+        train_tracker.step()
+        is_log_step = cfg.log_freq > 0 and step % cfg.log_freq == 0
+        is_saving_step = step % cfg.save_freq == 0 or step == cfg.steps
+        is_eval_step = cfg.eval_freq > 0 and step % cfg.eval_freq == 0
 
-        # Note: evaluate_and_checkpoint_if_needed happens **after** the `step`th training update has completed,
-        # so we pass in step + 1.
-        evaluate_and_checkpoint_if_needed(step + 1)
+        if is_log_step:
+            logging.info(train_tracker)
+            if wandb_logger:
+                wandb_log_dict = train_tracker.to_dict()
+                if output_dict:
+                    wandb_log_dict.update(output_dict)
+                wandb_logger.log_dict(wandb_log_dict, step)
+            train_tracker.reset_averages()
 
-    # create an empty online dataset similar to offline dataset
-    online_dataset = deepcopy(offline_dataset)
-    online_dataset.hf_dataset = {}
-    online_dataset.episode_data_index = {}
+        if cfg.save_checkpoint and is_saving_step:
+            logging.info(f"Checkpoint policy after step {step}")
+            checkpoint_dir = get_step_checkpoint_dir(cfg.output_dir, cfg.steps, step)
+            save_checkpoint(checkpoint_dir, step, cfg, policy, optimizer, lr_scheduler)
+            update_last_checkpoint(checkpoint_dir)
+            if wandb_logger:
+                wandb_logger.log_policy(checkpoint_dir)
 
-    # create dataloader for online training
-    concat_dataset = torch.utils.data.ConcatDataset([offline_dataset, online_dataset])
-    weights = [1.0] * len(concat_dataset)
-    sampler = torch.utils.data.WeightedRandomSampler(
-        weights, num_samples=len(concat_dataset), replacement=True
-    )
-    dataloader = torch.utils.data.DataLoader(
-        concat_dataset,
-        num_workers=4,
-        batch_size=cfg.training.batch_size,
-        sampler=sampler,
-        pin_memory=device.type != "cpu",
-        drop_last=False,
-    )
+        if cfg.env and is_eval_step:
+            step_id = get_step_identifier(step, cfg.steps)
+            logging.info(f"Eval policy at step {step}")
+            with (
+                torch.no_grad(),
+                torch.autocast(device_type=device.type) if cfg.policy.use_amp else nullcontext(),
+            ):
+                eval_info = eval_policy(
+                    eval_env,
+                    policy,
+                    cfg.eval.n_episodes,
+                    videos_dir=cfg.output_dir / "eval" / f"videos_step_{step_id}",
+                    max_episodes_rendered=4,
+                    start_seed=cfg.seed,
+                )
 
-    eval_env.close()
+            eval_metrics = {
+                "avg_sum_reward": AverageMeter("∑rwrd", ":.3f"),
+                "pc_success": AverageMeter("success", ":.1f"),
+                "eval_s": AverageMeter("eval_s", ":.3f"),
+            }
+            eval_tracker = MetricsTracker(
+                cfg.batch_size, dataset.num_frames, dataset.num_episodes, eval_metrics, initial_step=step
+            )
+            eval_tracker.eval_s = eval_info["aggregated"].pop("eval_s")
+            eval_tracker.avg_sum_reward = eval_info["aggregated"].pop("avg_sum_reward")
+            eval_tracker.pc_success = eval_info["aggregated"].pop("pc_success")
+            logging.info(eval_tracker)
+            if wandb_logger:
+                wandb_log_dict = {**eval_tracker.to_dict(), **eval_info}
+                wandb_logger.log_dict(wandb_log_dict, step, mode="eval")
+                wandb_logger.log_video(eval_info["video_paths"][0], step, mode="eval")
+
+    if eval_env:
+        eval_env.close()
     logging.info("End of training")
 
 
 if __name__ == "__main__":
-    train_cli()
+    init_logging()
+    train()
