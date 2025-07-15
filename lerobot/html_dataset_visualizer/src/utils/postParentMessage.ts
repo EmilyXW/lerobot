@@ -2,6 +2,10 @@
 export function postParentMessageWithParams(
   setParams: (params: URLSearchParams) => void,
 ) {
+  if (typeof window === 'undefined') {
+    return; // Don't run on server-side
+  }
+  
   const parentOrigin = "https://huggingface.co";
   const searchParams = new URLSearchParams();
   setParams(searchParams);
